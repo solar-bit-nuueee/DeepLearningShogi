@@ -9,7 +9,7 @@ from dlshogi.network.policy_value_network import policy_value_network
 from dlshogi import serializers
 from dlshogi.data_loader import Hcpe3DataLoader
 from dlshogi.data_loader import DataLoader
-
+from dlshogi.srigl_dlshogi import SRigLScheduler
 
 import argparse
 import random
@@ -58,6 +58,19 @@ def main(*argv):
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--patch', type=str, help='Overwrite with the hcpe')
     parser.add_argument('--cache', type=str, help='training data cache file')
+    
+    # SRigL arguments
+    parser.add_argument('--use_srigl', action='store_true', help='Use Structured RigL dynamic sparse training')
+    parser.add_argument('--srigl_sparsity', type=float, default=0.9, help='Target sparsity for SRigL')
+    parser.add_argument('--srigl_update_freq', type=int, default=1000, help='SRigL topology update frequency')
+    parser.add_argument('--srigl_warmup_steps', type=int, default=0, help='Dense training steps before SRigL starts')
+    parser.add_argument('--srigl_alpha_init', type=float, default=0.3, help='Initial update rate for SRigL')
+    parser.add_argument('--srigl_alpha_final', type=float, default=0.0, help='Final update rate for SRigL')
+    parser.add_argument('--srigl_gamma_sal', type=float, default=0.3, help='Neuron ablation threshold')
+    parser.add_argument('--srigl_delta_T', type=int, default=100, help='Dense gradient sampling interval')
+    parser.add_argument('--srigl_use_erk', action='store_true', help='Use ERK distribution for layer-wise sparsity')
+    parser.add_argument('--srigl_min_fan_in', type=int, default=1, help='Minimum fan-in per neuron')
+    
     args = parser.parse_args(argv)
 
     if args.log:
@@ -130,6 +143,40 @@ def main(*argv):
         ema_b = 1 / (args.swa_n_avr + 1)
         ema_avg = lambda averaged_model_parameter, model_parameter, num_averaged : ema_a * averaged_model_parameter + ema_b * model_parameter
         swa_model = AveragedModel(model, avg_fn=ema_avg)
+    
+    # Initialize SRigL if enabled
+    srigl = None
+    if args.use_srigl:
+        logging.info(f'use srigl(sparsity={args.srigl_sparsity}, update_freq={args.srigl_update_freq}, warmup_steps={args.srigl_warmup_steps})')
+        srigl = SRigLScheduler(
+            model=model,
+            sparsity=args.srigl_sparsity,
+            update_freq=args.srigl_update_freq,
+            warmup_steps=args.srigl_warmup_steps,
+            alpha_init=args.srigl_alpha_init,
+            alpha_final=args.srigl_alpha_final,
+            gamma_sal=args.srigl_gamma_sal,
+            delta_T=args.srigl_delta_T,
+            use_erk_distribution=args.srigl_use_erk,
+            min_fan_in=args.srigl_min_fan_in,
+            device=device
+        )
+        
+        # Set forward and loss functions for dense gradient sampling
+        def forward_fn(batch):
+            x1, x2, t1, t2, value = batch
+            return model(x1, x2)
+        
+        def loss_fn(outputs, batch):
+            y1, y2 = outputs
+            x1, x2, t1, t2, value = batch
+            loss1 = cross_entropy_loss_with_soft_target(y1, t1).mean()
+            loss2 = bce_with_logits_loss(y2, t2)
+            loss3 = bce_with_logits_loss(y2, value)
+            return loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3
+        
+        srigl.set_forward_loss_fn(forward_fn, loss_fn)
+    
     def cross_entropy_loss_with_soft_target(pred, soft_targets):
         return torch.sum(-soft_targets * F.log_softmax(pred, dim=1), 1)
     cross_entropy_loss = torch.nn.CrossEntropyLoss(reduction='none')
@@ -168,6 +215,16 @@ def main(*argv):
                 scaler.load_state_dict(checkpoint['scaler'])
             if args.lr_scheduler and not args.reset_scheduler and 'scheduler' in checkpoint:
                 scheduler.load_state_dict(checkpoint['scheduler'])
+            if args.use_srigl and 'srigl' in checkpoint:
+                # Restore SRigL state
+                srigl_state = checkpoint['srigl']
+                srigl.masks = srigl_state['masks']
+                srigl.fan_in = srigl_state['fan_in']
+                srigl.dense_gradients = srigl_state['dense_gradients']
+                srigl.gradient_steps = srigl_state['gradient_steps']
+                srigl.total_updates = srigl_state['total_updates']
+                srigl.next_dense_sample = srigl_state['next_dense_sample']
+                logging.info('Restored SRigL state')
         else:
             # for compatibility
             logging.info('Loading the optimizer state from {}'.format(args.resume))
@@ -265,6 +322,16 @@ def main(*argv):
             checkpoint['swa_model'] = swa_model.state_dict()
         if args.lr_scheduler:
             checkpoint['scheduler'] = scheduler.state_dict()
+        if args.use_srigl and srigl is not None:
+            # Save SRigL state
+            checkpoint['srigl'] = {
+                'masks': srigl.masks,
+                'fan_in': srigl.fan_in,
+                'dense_gradients': srigl.dense_gradients,
+                'gradient_steps': srigl.gradient_steps,
+                'total_updates': srigl.total_updates,
+                'next_dense_sample': srigl.next_dense_sample
+            }
 
         torch.save(checkpoint, path)
 
@@ -292,6 +359,10 @@ def main(*argv):
         sum_loss3_epoch = 0
         sum_loss_epoch = 0
         for x1, x2, t1, t2, value in train_dataloader:
+            # SRigL: before step (dense gradient sampling)
+            if args.use_srigl and srigl is not None:
+                srigl.before_step((x1, x2, t1, t2, value))
+            
             t += 1
             steps += 1
             with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=amp_dtype):
@@ -313,11 +384,20 @@ def main(*argv):
                 loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3
 
             scaler.scale(loss).backward()
+            
+            # SRigL: after backward (mask gradients)
+            if args.use_srigl and srigl is not None:
+                srigl.after_backward()
+            
             if args.clip_grad_max_norm:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_max_norm)
             scaler.step(optimizer)
             scaler.update()
+            
+            # SRigL: after step (mask weights and update topology)
+            if args.use_srigl and srigl is not None:
+                srigl.after_step(t)
 
             if args.use_swa and epoch >= args.swa_start_epoch and t % args.swa_freq == 0:
                 swa_model.update_parameters(model)
