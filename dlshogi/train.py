@@ -21,7 +21,20 @@ import importlib
 import logging
 
 def main(*argv):
-    parser = argparse.ArgumentParser(description='Train policy value network')
+    parser = argparse.ArgumentParser(
+        description='Train policy value network',
+        epilog='''
+Optimizer Examples:
+  SGD with momentum:     --optimizer 'SGD(momentum=0.9,nesterov=True)'
+  Adam:                  --optimizer 'Adam(betas=(0.9,0.999))'
+  AdamW:                 --optimizer 'AdamW(betas=(0.9,0.999))'
+  Muon (recommended):    --optimizer 'muon.Muon(momentum=0.95,nesterov=True)'
+  
+  Note: Install Muon with: pip install muon-optimizer
+  Muon typically converges 2-3x faster than AdamW for deep networks.
+''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument('train_data', type=str, nargs='+', help='training data file')
     parser.add_argument('test_data', type=str, help='test data file')
     parser.add_argument('--batchsize', '-b', type=int, default=1024, help='Number of positions in each mini-batch')
@@ -34,7 +47,8 @@ def main(*argv):
     parser.add_argument('--model', type=str, help='model file name')
     parser.add_argument('--initmodel', '-m', default='', help='Initialize the model from given file (for compatibility)')
     parser.add_argument('--log', help='log file path')
-    parser.add_argument('--optimizer', default='SGD(momentum=0.9,nesterov=True)', help='optimizer')
+    parser.add_argument('--optimizer', default='SGD(momentum=0.9,nesterov=True)', 
+                       help='optimizer (e.g., SGD(...), Adam(...), muon.Muon(...))')
     parser.add_argument('--lr', type=float, default=0.01, help='learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0001, help='weight decay rate')
     parser.add_argument('--lr_scheduler', help='learning rate scheduler')
@@ -99,15 +113,34 @@ def main(*argv):
     model.to(device)
 
     def create_optimizer(optimizer_str, model_params, lr, weight_decay):
+        """Create optimizer from string specification.
+        
+        Supports both built-in PyTorch optimizers and external packages.
+        Examples:
+            'SGD(momentum=0.9)' -> torch.optim.SGD
+            'Adam()' -> torch.optim.Adam
+            'muon.Muon(momentum=0.95)' -> muon.Muon (requires: pip install muon-optimizer)
+        """
         optimizer_name, optimizer_args = optimizer_str.split('(', 1)
         optimizer_args = eval(f'dict({optimizer_args.rstrip(")")})')
+        
+        # Handle module.class notation (e.g., muon.Muon)
         if '.' in optimizer_name:
             module_name, class_name = optimizer_name.rsplit('.', 1)
-            module = importlib.import_module(module_name)
-            optimizer_class = getattr(module, class_name)
+            try:
+                module = importlib.import_module(module_name)
+                optimizer_class = getattr(module, class_name)
+            except ImportError as e:
+                raise ImportError(
+                    f"Failed to import optimizer '{optimizer_name}'. "
+                    f"If using Muon, install with: pip install muon-optimizer\n"
+                    f"Original error: {e}"
+                )
         else:
+            # Built-in PyTorch optimizer
             optimizer_class = getattr(optim, optimizer_name)
 
+        # Add weight_decay if specified
         if weight_decay >= 0:
             optimizer_args["weight_decay"] = weight_decay
 
