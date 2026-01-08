@@ -16,6 +16,8 @@ from dlshogi.common import FEATURES1_NUM, FEATURES2_NUM, MAX_MOVE_LABEL_NUM
 # - Policy/Value heads follow dlshogi conventions (policy logits are 9*9*MAX_MOVE_LABEL_NUM).
 # - Input: x1 (FEATURES1_NUM,9,9), x2 (FEATURES2_NUM,9,9)
 #   x2 is reduced by mean pooling to (B, FEATURES2_NUM) then projected and added to all tokens (A1).
+# - IMPORTANT: Neighbor access in StripMLPLayer uses non-cyclic padding (F.pad) instead of torch.roll
+#   to avoid unintended wrap-around interactions on a finite 9x9 shogi board.
 # -----------------------------------------------------------------------------
 
 class Bias(nn.Module):
@@ -68,12 +70,17 @@ class StripMLPLayer(nn.Module):
       - Row mixing: for each column j, concat tokens from columns (j-1,j,j+1) then linear -> C
       - Col mixing: for each row i,    concat tokens from rows    (i-1,i,i+1) then linear -> C
 
-    This is a faithful implementation of the core cross-strip formulation in the paper.
+    NOTE:
+      Using torch.roll would create periodic boundary conditions (wrap-around).
+      For a finite shogi board, that can introduce unintended interactions between
+      opposite edges, so we use explicit non-cyclic padding via F.pad.
     """
-    def __init__(self, dim: int, direction: str):
+    def __init__(self, dim: int, direction: str, pad_mode: str = "constant"):
         super().__init__()
         assert direction in ("row", "col")
+        assert pad_mode in ("constant", "replicate")
         self.direction = direction
+        self.pad_mode = pad_mode
         self.proj = nn.Linear(3 * dim, dim)
 
     def forward(self, x, H: int, W: int):
@@ -83,15 +90,19 @@ class StripMLPLayer(nn.Module):
 
         if self.direction == "row":
             # mix along width (columns): use neighbors j-1, j, j+1
-            left  = torch.roll(x2d, shifts=1, dims=2)
-            mid   = x2d
-            right = torch.roll(x2d, shifts=-1, dims=2)
+            # pad W dimension by 1 on both sides
+            # F.pad expects (..., W, C) with pad tuple for last dims: (pad_C_l, pad_C_r, pad_W_l, pad_W_r, pad_H_l, pad_H_r)
+            xpad = F.pad(x2d, (0, 0, 1, 1, 0, 0), mode=self.pad_mode)  # (B,H,W+2,C)
+            left = xpad[:, :, 0:W, :]
+            mid = xpad[:, :, 1:W+1, :]
+            right = xpad[:, :, 2:W+2, :]
             cat = torch.cat([left, mid, right], dim=-1)  # (B,H,W,3C)
         else:
             # mix along height (rows): use neighbors i-1, i, i+1
-            up    = torch.roll(x2d, shifts=1, dims=1)
-            mid   = x2d
-            down  = torch.roll(x2d, shifts=-1, dims=1)
+            xpad = F.pad(x2d, (0, 0, 0, 0, 1, 1), mode=self.pad_mode)  # (B,H+2,W,C)
+            up = xpad[:, 0:H, :, :]
+            mid = xpad[:, 1:H+1, :, :]
+            down = xpad[:, 2:H+2, :, :]
             cat = torch.cat([up, mid, down], dim=-1)      # (B,H,W,3C)
 
         out = self.proj(cat)  # (B,H,W,C)
@@ -113,20 +124,19 @@ class CGSMM(nn.Module):
 
     This preserves the key idea: channel-wise specificity for token mixing and cascade row/col.
     """
-    def __init__(self, dim: int, patches: int = 4):
+    def __init__(self, dim: int, patches: int = 4, pad_mode: str = "constant"):
         super().__init__()
         assert dim % patches == 0
         self.patches = patches
         self.group_dim = dim // patches
 
-        self.col_mix = nn.ModuleList([StripMLPLayer(self.group_dim, "col") for _ in range(patches)])
-        self.row_mix = nn.ModuleList([StripMLPLayer(self.group_dim, "row") for _ in range(patches)])
+        self.col_mix = nn.ModuleList([StripMLPLayer(self.group_dim, "col", pad_mode=pad_mode) for _ in range(patches)])
+        self.row_mix = nn.ModuleList([StripMLPLayer(self.group_dim, "row", pad_mode=pad_mode) for _ in range(patches)])
 
         self.channel_fc = nn.Linear(2 * dim, dim)
 
     def forward(self, x, H: int, W: int):
         # x: (B,N,C)
-        b, n, c = x.shape
         xs = torch.split(x, self.group_dim, dim=-1)
 
         # column mixing per patch
@@ -150,10 +160,10 @@ class LSMM(nn.Module):
     For 9x9, we implement a local variant by mixing row+col with strip width=3 and
     a lightweight gating (softmax re-weight) across 3 branches.
     """
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, pad_mode: str = "constant"):
         super().__init__()
-        self.row = StripMLPLayer(dim, "row")
-        self.col = StripMLPLayer(dim, "col")
+        self.row = StripMLPLayer(dim, "row", pad_mode=pad_mode)
+        self.col = StripMLPLayer(dim, "col", pad_mode=pad_mode)
         self.id  = nn.Identity()
 
         self.gate = nn.Sequential(
@@ -164,7 +174,6 @@ class LSMM(nn.Module):
 
     def forward(self, x, H: int, W: int):
         # x: (B,N,C)
-        b, n, c = x.shape
         a = self.row(x, H, W)
         b2 = self.col(x, H, W)
         c2 = self.id(x)
@@ -188,13 +197,13 @@ class StripMixingBlock(nn.Module):
       - Back to tokens -> MLPBNGELU
       - Split channels -> CGSMM/LSMM -> concat -> FC -> residual
     """
-    def __init__(self, dim: int, hidden: int, patches: int = 4):
+    def __init__(self, dim: int, hidden: int, patches: int = 4, pad_mode: str = "constant"):
         super().__init__()
         self.dwconv = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
         self.mlp = MLPBNGELU(dim, hidden)
 
-        self.cgsmm = CGSMM(dim // 2, patches=max(1, patches // 2)) if dim >= 2 else nn.Identity()
-        self.lsmm = LSMM(dim // 2) if dim >= 2 else nn.Identity()
+        self.cgsmm = CGSMM(dim // 2, patches=max(1, patches // 2), pad_mode=pad_mode) if dim >= 2 else nn.Identity()
+        self.lsmm = LSMM(dim // 2, pad_mode=pad_mode) if dim >= 2 else nn.Identity()
 
         self.fuse = nn.Linear(dim, dim)
 
@@ -260,7 +269,7 @@ class PolicyValueNetwork(nn.Module):
       - policy logits: (B, 9*9*MAX_MOVE_LABEL_NUM)
       - value logit: (B, 1)
     """
-    def __init__(self, d: int = 128, hidden: int = 512, depth: int = 8, patches: int = 4, fcl: int = 256):
+    def __init__(self, d: int = 128, hidden: int = 512, depth: int = 8, patches: int = 4, fcl: int = 256, pad_mode: str = "constant"):
         super().__init__()
         self.H = 9
         self.W = 9
@@ -274,7 +283,7 @@ class PolicyValueNetwork(nn.Module):
 
         self.blocks = nn.ModuleList([])
         for _ in range(depth):
-            self.blocks.append(StripMixingBlock(d, hidden, patches=patches))
+            self.blocks.append(StripMixingBlock(d, hidden, patches=patches, pad_mode=pad_mode))
             self.blocks.append(ChannelMixingBlock(d, hidden))
 
         # policy head: per-token logits then flatten like original
