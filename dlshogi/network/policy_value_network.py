@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import re
 
+
 def policy_value_network(network, add_sigmoid=False):
     m = re.match(r'^(.*?)(\d+)(x\d+){0,1}(_fcl\d+){0,1}(_reduction\d+){0,1}(_.+){0,1}$', network)
     # wideresnet10 and resnet10_swish are treated specially because there are published models
@@ -9,6 +10,9 @@ def policy_value_network(network, add_sigmoid=False):
         from dlshogi.network.policy_value_network_wideresnet10 import PolicyValueNetwork
     elif network == 'resnet10_swish':
         from dlshogi.network.policy_value_network_resnet10_swish import PolicyValueNetwork
+    # custom networks without the "name+digits" convention
+    elif network == 'stripmlp':
+        from dlshogi.network.policy_value_network_stripmlp import PolicyValueNetwork
     elif m:
         from importlib import import_module
         module = import_module(f'dlshogi.network.policy_value_network_{m[1]}')
@@ -33,7 +37,7 @@ def policy_value_network(network, add_sigmoid=False):
 
         PolicyValueNetwork = PolicyValueNetworkAddSigmoid
 
-    if network in [ 'wideresnet10', 'resnet10_swish' ]:
+    if network in [ 'wideresnet10', 'resnet10_swish', 'stripmlp' ]:
         return PolicyValueNetwork()
     elif m:
         # blocks
