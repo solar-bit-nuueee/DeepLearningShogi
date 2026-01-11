@@ -12,7 +12,7 @@ from dlshogi.data_loader import DataLoader
 from dlshogi.srigl_dlshogi import SRigLScheduler
 
 # Import DynaDiag components
-from dlshogi.dynadiag import convert_to_dynadiag, DynaDiagScheduler
+from dlshogi.dynadiag import convert_to_dynadiag, DynaDiagScheduler, get_dynadiag_l1_reg
 
 import argparse
 import random
@@ -95,6 +95,7 @@ Optimizer Examples:
     parser.add_argument('--dynadiag_sparsity', type=float, default=0.9, help='Target sparsity for DynaDiag')
     parser.add_argument('--dynadiag_temp_init', type=float, default=10.0, help='Initial temperature for DynaDiag TopK')
     parser.add_argument('--dynadiag_temp_final', type=float, default=0.1, help='Final temperature for DynaDiag TopK')
+    parser.add_argument('--dynadiag_l1_lambda', type=float, default=1e-5, help='L1 regularization coefficient for DynaDiag alpha')
 
     args = parser.parse_args(argv)
 
@@ -245,7 +246,7 @@ Optimizer Examples:
     
     # Initialize DynaDiag Scheduler
     if args.use_dynadiag:
-        logging.info(f'use dynadiag(sparsity={args.dynadiag_sparsity}, temp_init={args.dynadiag_temp_init})')
+        logging.info(f'use dynadiag(sparsity={args.dynadiag_sparsity}, temp_init={args.dynadiag_temp_init}, l1_lambda={args.dynadiag_l1_lambda})')
         dynadiag_scheduler = DynaDiagScheduler(
             model=model,
             temperature_init=args.dynadiag_temp_init,
@@ -445,6 +446,11 @@ Optimizer Examples:
                 loss2 = bce_with_logits_loss(y2, t2)
                 loss3 = bce_with_logits_loss(y2, value)
                 loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3
+                
+                # DynaDiag L1 Regularization
+                if args.use_dynadiag:
+                    l1_reg = get_dynadiag_l1_reg(model)
+                    loss += args.dynadiag_l1_lambda * l1_reg
 
             scaler.scale(loss).backward()
             
