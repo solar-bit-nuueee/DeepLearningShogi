@@ -37,7 +37,7 @@ class SRigLScheduler:
             optimizer.step()
             
             # 5. Apply mask to weights and update topology
-            srigl.after_step(step)
+            srigl.after_step(step, optimizer)
     """
     
     def __init__(self, 
@@ -45,12 +45,14 @@ class SRigLScheduler:
                  sparsity=0.9,
                  update_freq=1000,
                  warmup_steps=0,
+                 total_steps=100000,
                  alpha_init=0.3,
                  alpha_final=0.0,
                  gamma_sal=0.3,
                  delta_T=100,
                  use_erk_distribution=True,
                  min_fan_in=1,
+                 prune_1x1=False,
                  device='cuda'):
         """
         Args:
@@ -58,29 +60,34 @@ class SRigLScheduler:
             sparsity: Target global sparsity
             update_freq: Topology update frequency (ΔT)
             warmup_steps: Dense training before first update
+            total_steps: Total training steps (used for alpha schedule)
             alpha_init: Initial update rate (K = α * active_weights)
             alpha_final: Final update rate (typically 0.0)
             gamma_sal: Neuron ablation threshold (γ_sal)
             delta_T: Dense gradient sampling interval (δT)
             use_erk_distribution: Use ERK for layer-wise sparsity
             min_fan_in: Minimum fan-in per neuron
+            prune_1x1: Whether to prune 1x1 convolutions
             device: Device for computations
         """
         self.model = model
         self.sparsity = sparsity
         self.update_freq = update_freq
         self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
         self.alpha_init = alpha_init
         self.alpha_final = alpha_final
         self.gamma_sal = gamma_sal
         self.delta_T = delta_T
         self.use_erk_distribution = use_erk_distribution
         self.min_fan_in = min_fan_in
+        self.prune_1x1 = prune_1x1
         self.device = device
         
         # State
         self.masks = {}
         self.fan_in = {}  # k' per layer
+        self.layer_targets = {} # Target total non-zero params per layer
         self.dense_gradients = {}  # True dense gradients
         self.gradient_steps = 0
         self.layers_to_prune = []
@@ -99,11 +106,13 @@ class SRigLScheduler:
         print(f"Target Sparsity: {self.sparsity:.4f}")
         print(f"Update Frequency (ΔT): {self.update_freq} steps")
         print(f"Warmup Steps: {self.warmup_steps}")
+        print(f"Total Steps: {self.total_steps}")
         print(f"Alpha Schedule: {self.alpha_init} → {self.alpha_final} (cosine)")
         print(f"Neuron Ablation (γ_sal): {self.gamma_sal}")
         print(f"Dense Gradient Sampling (δT): {self.delta_T} steps")
         print(f"ERK Distribution: {self.use_erk_distribution}")
         print(f"Min Fan-in: {self.min_fan_in}")
+        print(f"Prune 1x1 Conv: {self.prune_1x1}")
         print(f"{'='*70}\n")
         
         self._initialize()
@@ -113,10 +122,10 @@ class SRigLScheduler:
         # Identify Conv2d and Linear layers
         for name, module in self.model.named_modules():
             if isinstance(module, (nn.Conv2d, nn.Linear)):
-                # Skip 1x1 convs and small layers if desired
                 if isinstance(module, nn.Conv2d):
-                    if module.kernel_size == (1, 1) and module.in_channels == module.out_channels:
-                        continue  # Skip skip connections
+                    # Skip 1x1 convs if requested
+                    if not self.prune_1x1 and module.kernel_size == (1, 1):
+                        continue
                 self.layers_to_prune.append((name, module))
         
         if len(self.layers_to_prune) == 0:
@@ -158,6 +167,8 @@ class SRigLScheduler:
             
             fan_in = layer_fan_in[name]
             self.fan_in[name] = fan_in
+            # Store target non-zero count for this layer to preserve distribution during re-computation
+            self.layer_targets[name] = n_out * fan_in 
             
             # Initialize mask
             mask = self._initialize_constant_fanin_mask(shape, fan_in)
@@ -309,23 +320,23 @@ class SRigLScheduler:
         # Save current masks
         saved_masks = {name: mask.clone() for name, mask in self.masks.items()}
         
-        # Temporarily set dense masks
-        for name, module in self.layers_to_prune:
-            if isinstance(module, nn.Conv2d):
-                n_out = module.out_channels
-                n_in = module.in_channels * module.kernel_size[0] * module.kernel_size[1]
-                self.masks[name] = torch.ones((n_out, n_in), device=self.device)
-            else:
-                self.masks[name] = torch.ones_like(module.weight)
-        
-        # Apply dense masks to weights
-        self._apply_masks_to_weights()
-        
-        # Zero gradients
-        self.model.zero_grad()
-        
-        # Forward + backward with dense weights
         try:
+            # Temporarily set dense masks
+            for name, module in self.layers_to_prune:
+                if isinstance(module, nn.Conv2d):
+                    n_out = module.out_channels
+                    n_in = module.in_channels * module.kernel_size[0] * module.kernel_size[1]
+                    self.masks[name] = torch.ones((n_out, n_in), device=self.device)
+                else:
+                    self.masks[name] = torch.ones_like(module.weight)
+            
+            # Apply dense masks to weights
+            self._apply_masks_to_weights()
+            
+            # Zero gradients
+            self.model.zero_grad()
+            
+            # Forward + backward with dense weights
             outputs = self.forward_fn(self.cached_batch)
             loss = self.loss_fn(outputs, self.cached_batch)
             loss.backward()
@@ -343,12 +354,14 @@ class SRigLScheduler:
                         self.dense_gradients[name] = torch.abs(module.weight.grad.clone())
         except Exception as e:
             print(f"[ERROR] Dense gradient sampling failed: {e}")
-        
-        # Restore masks
-        self.masks = saved_masks
-        
-        # Clear gradients (don't update weights)
-        self.model.zero_grad()
+        finally:
+            # Restore masks AND re-apply them to weights immediately
+            # Important: Ensure weights are sparse before next training step
+            self.masks = saved_masks
+            self._apply_masks_to_weights()
+            
+            # Clear gradients (don't update weights with dense gradients)
+            self.model.zero_grad()
     
     def after_backward(self):
         """
@@ -370,12 +383,13 @@ class SRigLScheduler:
                 else:
                     module.weight.grad.mul_(mask)
     
-    def after_step(self, global_step):
+    def after_step(self, global_step, optimizer=None):
         """
         Call after optimizer.step(). Applies mask to weights and performs topology updates.
         
         Args:
             global_step: Current training step
+            optimizer: Optimizer (for resetting state of regrown weights)
         """
         if not self.initialized:
             return
@@ -390,7 +404,7 @@ class SRigLScheduler:
         
         # Periodic topology updates
         if global_step > self.warmup_steps and (global_step - self.warmup_steps) % self.update_freq == 0:
-            self._srigl_update(global_step)
+            self._srigl_update(global_step, optimizer)
     
     def _apply_masks_to_weights(self):
         """Apply masks to model weights."""
@@ -447,23 +461,75 @@ class SRigLScheduler:
         print("")
     
     def _compute_alpha(self, step):
-        """Cosine decay schedule for update rate α(t)."""
-        if step <= self.warmup_steps:
-            return self.alpha_init
-        
-        progress = (step - self.warmup_steps) / (self.update_freq * 100)
-        progress = min(1.0, progress)
+        """Cosine decay schedule for update rate α(t).
+        Decays from alpha_init to alpha_final over 75% of total training steps
+        or total_updates if total_steps is not provided.
+        """
+        # If total_steps is set, use it for schedule
+        if self.total_steps > 0:
+            # End schedule at 75% of training (common RigL practice)
+            end_step = self.warmup_steps + 0.75 * (self.total_steps - self.warmup_steps)
+            if step >= end_step:
+                return self.alpha_final
+            
+            progress = (step - self.warmup_steps) / (end_step - self.warmup_steps)
+        else:
+            # Fallback to update_freq based (original impl)
+            progress = (step - self.warmup_steps) / (self.update_freq * 100)
+            
+        progress = min(1.0, max(0.0, progress))
         
         alpha = self.alpha_final + 0.5 * (self.alpha_init - self.alpha_final) * (1 + math.cos(math.pi * progress))
         return alpha
     
-    def _srigl_update(self, global_step):
+    def _reset_optimizer_state(self, optimizer, old_mask, new_mask, param):
+        """Reset optimizer state (momentum, etc) for regrown weights."""
+        if optimizer is None: return
+        
+        # grew: 0 -> 1, pruned: 1 -> 0
+        grew = (old_mask == 0) & (new_mask == 1)
+        pruned = (old_mask == 1) & (new_mask == 0)
+        
+        state = optimizer.state.get(param)
+        if state is None: return
+        
+        # Support for SGD, AdamW, Muon
+        # keys to reset: 'momentum_buffer' (SGD), 'exp_avg', 'exp_avg_sq' (Adam*)
+        keys_to_reset = ['momentum_buffer', 'exp_avg', 'exp_avg_sq']
+        
+        # Muon specific state? Muon usually just has momentum_buffer
+        
+        for key in keys_to_reset:
+            if key in state:
+                buf = state[key]
+                # Ensure buffer shape matches param (especially for Conv2d 4D vs 2D mask)
+                if buf.shape != grew.shape:
+                    if len(buf.shape) == 4 and len(grew.shape) == 2:
+                         # Reshape mask to 4D for element-wise op
+                        n_out, n_in = grew.shape
+                        kh, kw = param.shape[2], param.shape[3]
+                        grew_View = grew.view(n_out, n_in // (kh*kw), kh, kw)
+                        pruned_View = pruned.view(n_out, n_in // (kh*kw), kh, kw)
+                        
+                        buf.mul_((~pruned_View).to(buf.dtype))
+                        buf[grew_View.bool()] = 0.0
+                else:
+                    buf.mul_((~pruned).to(buf.dtype))
+                    buf[grew.bool()] = 0.0
+    
+    def _srigl_update(self, global_step, optimizer=None):
         """
         SRigL topology update.
         """
         print(f"\n{'='*70}")
         print(f"SRigL Update #{self.total_updates + 1} at step {global_step}")
         print(f"{'='*70}")
+        
+        # Force dense gradient sample if stale
+        if (self.gradient_steps + 1) >= self.next_dense_sample:
+             print("Force sampling dense gradients before update...")
+             self._sample_dense_gradients()
+             self.next_dense_sample = self.gradient_steps + self.delta_T
         
         alpha = self._compute_alpha(global_step)
         print(f"Update rate α(t): {alpha:.4f}\n")
@@ -493,7 +559,7 @@ class SRigLScheduler:
             salient_mask = self._compute_salient_weights(mask, weight_2d, gradient, K)
             
             # Neuron ablation (paper Step 4)
-            mask, n_ablated, active_neurons = self._ablate_neurons(
+            new_mask, n_ablated, active_neurons = self._ablate_neurons(
                 mask, salient_mask, fan_in, self.gamma_sal
             )
             
@@ -501,8 +567,8 @@ class SRigLScheduler:
                 print(f"  Ablated neurons: {n_ablated}")
                 
                 # Recompute k' (paper Step 5)
-                target_active = int(n_out * n_in * (1 - self.sparsity))
-                new_fan_in = self._recompute_fan_in(mask, target_active)
+                # Use layer_targets to respect ERK distribution
+                new_fan_in = self._recompute_fan_in(name, new_mask)
                 
                 if new_fan_in != fan_in:
                     print(f"  Recomputed k': {fan_in} → {new_fan_in}")
@@ -510,24 +576,37 @@ class SRigLScheduler:
                     fan_in = new_fan_in
             
             # Redistribute connections (paper Steps 6 & 7)
-            mask = self._redistribute_connections(mask, weight_2d, gradient, fan_in, K)
+            final_mask = self._redistribute_connections(new_mask, weight_2d, gradient, fan_in, K)
+            
+            # Reset optimizer state for regrown weights
+            self._reset_optimizer_state(optimizer, mask, final_mask, module.weight)
             
             # Update mask
-            self.masks[name] = mask
+            self.masks[name] = final_mask
             
-            # Statistics
-            n_active_final = mask.sum().item()
-            n_active_neurons = (mask.sum(dim=1) > 0).sum().item()
-            actual_sparsity = 1.0 - (n_active_final / mask.numel())
-            fanin_per_neuron = mask.sum(dim=1)
+            # Consistency checks
+            nz = int(final_mask.sum().item())
+            # For strict ERK compliance, total active params should match target (within rounding/ablation limits)
+            # Note: Ablation + constant fan-in might drift slightly from original target if not perfectly divisible, 
+            # but usually it's close. We'll log it.
+            target_nz = self.layer_targets[name]
+            
+            # Check constant fan-in for active neurons
+            fanin_per_neuron = final_mask.sum(dim=1)
             active_fanins = fanin_per_neuron[fanin_per_neuron > 0]
-            avg_fanin = active_fanins.float().mean().item() if len(active_fanins) > 0 else 0
-            std_fanin = active_fanins.float().std().item() if len(active_fanins) > 0 else 0
+            if len(active_fanins) > 0:
+                min_f = active_fanins.min().item()
+                max_f = active_fanins.max().item()
+                assert min_f == max_f == fan_in, \
+                    f"Fan-in consistency failed! Target: {fan_in}, Min: {min_f}, Max: {max_f}"
+            
+            n_active_neurons = (final_mask.sum(dim=1) > 0).sum().item()
+            actual_sparsity = 1.0 - (nz / final_mask.numel())
             
             print(f"  Active neurons: {n_active_neurons}/{n_out}")
-            print(f"  Active connections: {int(n_active_final)}")
+            print(f"  Active connections: {nz} (Target: {target_nz})")
             print(f"  Sparsity: {actual_sparsity:.4f}")
-            print(f"  Fan-in: {avg_fanin:.2f} ± {std_fanin:.4f}")
+            print(f"  Fan-in: {fan_in}")
             print("")
         
         self.total_updates += 1
@@ -590,14 +669,23 @@ class SRigLScheduler:
         n_ablated = (~active_neurons).sum().item()
         return new_mask, n_ablated, active_neurons
     
-    def _recompute_fan_in(self, mask, target_active_weights):
-        """Recompute k' after neuron ablation (paper Step 5)."""
+    def _recompute_fan_in(self, name, mask):
+        """Recompute k' after neuron ablation (paper Step 5).
+        Correctly uses layer-specific target parameter counts to respect ERK.
+        """
+        # Retrieve target non-zero count for this layer (preserved from init)
+        target_active = self.layer_targets.get(name)
+        if target_active is None:
+             # Fallback if somehow missing (shouldn't happen)
+             n_out, n_in = mask.shape
+             target_active = int(n_out * n_in * (1 - self.sparsity))
+        
         n_active_neurons = (mask.sum(dim=1) > 0).sum().item()
         
         if n_active_neurons == 0:
             return self.min_fan_in
         
-        new_fan_in = max(self.min_fan_in, target_active_weights // n_active_neurons)
+        new_fan_in = max(self.min_fan_in, target_active // n_active_neurons)
         return new_fan_in
     
     def _redistribute_connections(self, mask, weight, gradient, fan_in, K):
@@ -645,22 +733,12 @@ class SRigLScheduler:
                 _, grow_local = torch.topk(row_grads, n_grow, largest=True)
                 mask[i, inactive_idx[grow_local]] = 1.0
             elif current > fan_in:
-                # Should not happen, but enforce in case of numerical quirks
+                # Should not happen if K_prune was effective, but safe-guard
                 active_idx = (mask[i] > 0).nonzero(as_tuple=True)[0]
                 row_w = torch.abs(weight[i, active_idx])
                 _, keep_local = torch.topk(row_w, fan_in, largest=True)
                 new_row = torch.zeros((n_in,), device=device, dtype=mask.dtype)
                 new_row[active_idx[keep_local]] = 1.0
                 mask[i] = new_row
-
-        # Strict constant fan-in check for active neurons
-        fanin_per_neuron = mask.sum(dim=1)
-        if active_neurons.any():
-            active_fanins = fanin_per_neuron[active_neurons]
-            # After Step 7, all active neurons should have exactly fan_in
-            assert torch.all(active_fanins == fan_in), (
-                f"Constant fan-in violated after redistribute: "
-                f"min={int(active_fanins.min().item())}, max={int(active_fanins.max().item())}, target={fan_in}"
-            )
 
         return mask
