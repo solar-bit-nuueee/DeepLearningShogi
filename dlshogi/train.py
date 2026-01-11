@@ -84,6 +84,7 @@ Optimizer Examples:
     parser.add_argument('--srigl_delta_T', type=int, default=100, help='Dense gradient sampling interval')
     parser.add_argument('--srigl_use_erk', action='store_true', help='Use ERK distribution for layer-wise sparsity')
     parser.add_argument('--srigl_min_fan_in', type=int, default=1, help='Minimum fan-in per neuron')
+    parser.add_argument('--srigl_prune_1x1', action='store_true', help='Enable pruning for 1x1 convolutions')
     
     args = parser.parse_args(argv)
 
@@ -177,6 +178,25 @@ Optimizer Examples:
         ema_avg = lambda averaged_model_parameter, model_parameter, num_averaged : ema_a * averaged_model_parameter + ema_b * model_parameter
         swa_model = AveragedModel(model, avg_fn=ema_avg)
     
+    logging.info('Reading training data')
+    train_len, actual_len = Hcpe3DataLoader.load_files(args.train_data, args.use_average, args.use_evalfix, args.temperature, args.patch, args.cache)
+    train_data = np.arange(train_len, dtype=np.uint64)
+    logging.info('Reading test data')
+    test_data = np.fromfile(args.test_data, dtype=HuffmanCodedPosAndEval)
+
+    if args.use_average:
+        logging.info('train position num before preprocessing = {}'.format(actual_len))
+    logging.info('train position num = {}'.format(len(train_data)))
+    logging.info('test position num = {}'.format(len(test_data)))
+
+    train_dataloader = Hcpe3DataLoader(train_data, args.batchsize, device, shuffle=True)
+    test_dataloader = DataLoader(test_data, args.testbatchsize, device)
+    
+    # Calculate estimated total steps for SRigL alpha schedule
+    steps_per_epoch = len(train_dataloader)
+    total_steps = steps_per_epoch * args.epoch
+    logging.info(f'Total training steps: {total_steps}')
+
     # Initialize SRigL if enabled
     srigl = None
     if args.use_srigl:
@@ -186,12 +206,14 @@ Optimizer Examples:
             sparsity=args.srigl_sparsity,
             update_freq=args.srigl_update_freq,
             warmup_steps=args.srigl_warmup_steps,
+            total_steps=total_steps, # Pass total steps for alpha schedule
             alpha_init=args.srigl_alpha_init,
             alpha_final=args.srigl_alpha_final,
             gamma_sal=args.srigl_gamma_sal,
             delta_T=args.srigl_delta_T,
             use_erk_distribution=args.srigl_use_erk,
             min_fan_in=args.srigl_min_fan_in,
+            prune_1x1=args.srigl_prune_1x1, # Pass 1x1 prune setting
             device=device
         )
         
@@ -253,6 +275,7 @@ Optimizer Examples:
                 srigl_state = checkpoint['srigl']
                 srigl.masks = srigl_state['masks']
                 srigl.fan_in = srigl_state['fan_in']
+                srigl.layer_targets = srigl_state.get('layer_targets', {}) # Restore layer targets
                 srigl.dense_gradients = srigl_state['dense_gradients']
                 srigl.gradient_steps = srigl_state['gradient_steps']
                 srigl.total_updates = srigl_state['total_updates']
@@ -269,20 +292,6 @@ Optimizer Examples:
         t = 0
 
     logging.info('optimizer {}'.format(re.sub(' +', ' ', str(optimizer).replace('\n', ''))))
-
-    logging.info('Reading training data')
-    train_len, actual_len = Hcpe3DataLoader.load_files(args.train_data, args.use_average, args.use_evalfix, args.temperature, args.patch, args.cache)
-    train_data = np.arange(train_len, dtype=np.uint64)
-    logging.info('Reading test data')
-    test_data = np.fromfile(args.test_data, dtype=HuffmanCodedPosAndEval)
-
-    if args.use_average:
-        logging.info('train position num before preprocessing = {}'.format(actual_len))
-    logging.info('train position num = {}'.format(len(train_data)))
-    logging.info('test position num = {}'.format(len(test_data)))
-
-    train_dataloader = Hcpe3DataLoader(train_data, args.batchsize, device, shuffle=True)
-    test_dataloader = DataLoader(test_data, args.testbatchsize, device)
 
     # for SWA update_bn
     def hcpe_loader(data, batchsize):
@@ -360,6 +369,7 @@ Optimizer Examples:
             checkpoint['srigl'] = {
                 'masks': srigl.masks,
                 'fan_in': srigl.fan_in,
+                'layer_targets': srigl.layer_targets, # Save layer targets
                 'dense_gradients': srigl.dense_gradients,
                 'gradient_steps': srigl.gradient_steps,
                 'total_updates': srigl.total_updates,
@@ -430,7 +440,8 @@ Optimizer Examples:
             
             # SRigL: after step (mask weights and update topology)
             if args.use_srigl and srigl is not None:
-                srigl.after_step(t)
+                # Pass optimizer to handle state reset for regrown weights
+                srigl.after_step(t, optimizer)
 
             if args.use_swa and epoch >= args.swa_start_epoch and t % args.swa_freq == 0:
                 swa_model.update_parameters(model)
