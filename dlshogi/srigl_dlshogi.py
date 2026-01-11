@@ -11,7 +11,7 @@ class SRigLScheduler:
     by Lasby et al. https://arxiv.org/abs/2305.02299
     
     Key Features:
-    1. True dense gradient sampling every δT steps
+    1. True dense gradient sampling every δT steps (with BN freeze and accumulation)
     2. Salient weights: union of top-K drop and grow sets
     3. Neuron ablation: count(salient) < γ_sal * k'
     4. Exact constant fan-in with strict enforcement
@@ -50,6 +50,7 @@ class SRigLScheduler:
                  alpha_final=0.0,
                  gamma_sal=0.3,
                  delta_T=100,
+                 dense_grad_accum=1,
                  use_erk_distribution=True,
                  min_fan_in=1,
                  prune_1x1=False,
@@ -65,6 +66,7 @@ class SRigLScheduler:
             alpha_final: Final update rate (typically 0.0)
             gamma_sal: Neuron ablation threshold (γ_sal)
             delta_T: Dense gradient sampling interval (δT)
+            dense_grad_accum: Number of mini-batches to accumulate for dense gradients
             use_erk_distribution: Use ERK for layer-wise sparsity
             min_fan_in: Minimum fan-in per neuron
             prune_1x1: Whether to prune 1x1 convolutions
@@ -79,6 +81,7 @@ class SRigLScheduler:
         self.alpha_final = alpha_final
         self.gamma_sal = gamma_sal
         self.delta_T = delta_T
+        self.dense_grad_accum = dense_grad_accum
         self.use_erk_distribution = use_erk_distribution
         self.min_fan_in = min_fan_in
         self.prune_1x1 = prune_1x1
@@ -96,7 +99,7 @@ class SRigLScheduler:
         self.next_dense_sample = delta_T
         
         # For dense gradient sampling
-        self.cached_batch = None
+        self.cached_batches = []
         self.forward_fn = None
         self.loss_fn = None
         
@@ -109,7 +112,7 @@ class SRigLScheduler:
         print(f"Total Steps: {self.total_steps}")
         print(f"Alpha Schedule: {self.alpha_init} → {self.alpha_final} (cosine)")
         print(f"Neuron Ablation (γ_sal): {self.gamma_sal}")
-        print(f"Dense Gradient Sampling (δT): {self.delta_T} steps")
+        print(f"Dense Gradient Sampling (δT): {self.delta_T} steps (accum={self.dense_grad_accum})")
         print(f"ERK Distribution: {self.use_erk_distribution}")
         print(f"Min Fan-in: {self.min_fan_in}")
         print(f"Prune 1x1 Conv: {self.prune_1x1}")
@@ -123,6 +126,10 @@ class SRigLScheduler:
         for name, module in self.model.named_modules():
             if isinstance(module, (nn.Conv2d, nn.Linear)):
                 if isinstance(module, nn.Conv2d):
+                    # Skip grouped convolutions (groups > 1) to avoid complexity for now
+                    if module.groups > 1:
+                        print(f"[INFO] Skipping grouped convolution layer: {name} (groups={module.groups})")
+                        continue
                     # Skip 1x1 convs if requested
                     if not self.prune_1x1 and module.kernel_size == (1, 1):
                         continue
@@ -278,12 +285,6 @@ class SRigLScheduler:
     def set_forward_loss_fn(self, forward_fn, loss_fn):
         """
         Set forward and loss functions for dense gradient sampling.
-        
-        Args:
-            forward_fn: Function that takes batch and returns model outputs
-                       Example: lambda batch: model(batch['x1'], batch['x2'])
-            loss_fn: Function that computes loss from outputs and batch
-                     Example: lambda outputs, batch: compute_loss(outputs, batch)
         """
         self.forward_fn = forward_fn
         self.loss_fn = loss_fn
@@ -291,27 +292,32 @@ class SRigLScheduler:
     def before_step(self, batch):
         """
         Call before optimizer step. Handles dense gradient sampling.
-        
-        Args:
-            batch: Current batch data (dict or tuple)
         """
         if not self.initialized:
             return
         
         self.gradient_steps += 1
         
-        # Cache batch for dense gradient sampling
-        self.cached_batch = batch
+        # Cache batch for accumulation
+        self.cached_batches.append(batch)
+        if len(self.cached_batches) > self.dense_grad_accum:
+             self.cached_batches.pop(0)
         
         # Dense gradient sampling at δT intervals
         if self.gradient_steps >= self.next_dense_sample:
-            print(f"[Dense Gradient Sampling at step {self.gradient_steps}]")
-            self._sample_dense_gradients()
-            self.next_dense_sample = self.gradient_steps + self.delta_T
+            # Only sample if we have enough accumulated batches
+            if len(self.cached_batches) >= self.dense_grad_accum:
+                print(f"[Dense Gradient Sampling at step {self.gradient_steps} (accum={self.dense_grad_accum})]")
+                self._sample_dense_gradients()
+                self.next_dense_sample = self.gradient_steps + self.delta_T
+            else:
+                # Postpone sampling slightly until we have enough batches
+                pass 
     
     def _sample_dense_gradients(self):
         """
         Sample true dense gradients by temporarily removing masks.
+        Accumulates over cached_batches to reduce noise.
         """
         if self.forward_fn is None or self.loss_fn is None:
             print("[WARNING] forward_fn and loss_fn not set. Skipping dense gradient sampling.")
@@ -320,7 +326,15 @@ class SRigLScheduler:
         # Save current masks
         saved_masks = {name: mask.clone() for name, mask in self.masks.items()}
         
+        # Reset dense gradients buffer
+        for name in self.dense_gradients:
+             self.dense_gradients[name].zero_()
+
+        training_mode = self.model.training
         try:
+            # Set to Eval mode for BatchNorm stability (freeze running stats)
+            self.model.eval()
+            
             # Temporarily set dense masks
             for name, module in self.layers_to_prune:
                 if isinstance(module, nn.Conv2d):
@@ -333,28 +347,37 @@ class SRigLScheduler:
             # Apply dense masks to weights
             self._apply_masks_to_weights()
             
-            # Zero gradients
-            self.model.zero_grad()
+            # Accumulate gradients
+            for batch in self.cached_batches:
+                self.model.zero_grad()
+                outputs = self.forward_fn(batch)
+                loss = self.loss_fn(outputs, batch)
+                loss.backward()
+                
+                # Accumulate dense gradients
+                with torch.no_grad():
+                    for name, module in self.layers_to_prune:
+                        if module.weight.grad is not None:
+                            if isinstance(module, nn.Conv2d):
+                                # Reshape to 2D
+                                n_out = module.out_channels
+                                n_in = module.in_channels * module.kernel_size[0] * module.kernel_size[1]
+                                grad_2d = module.weight.grad.view(n_out, n_in)
+                                self.dense_gradients[name].add_(torch.abs(grad_2d))
+                            else:
+                                self.dense_gradients[name].add_(torch.abs(module.weight.grad))
             
-            # Forward + backward with dense weights
-            outputs = self.forward_fn(self.cached_batch)
-            loss = self.loss_fn(outputs, self.cached_batch)
-            loss.backward()
-            
-            # Store dense gradients
-            for name, module in self.layers_to_prune:
-                if module.weight.grad is not None:
-                    if isinstance(module, nn.Conv2d):
-                        # Reshape to 2D
-                        n_out = module.out_channels
-                        n_in = module.in_channels * module.kernel_size[0] * module.kernel_size[1]
-                        grad_2d = module.weight.grad.view(n_out, n_in)
-                        self.dense_gradients[name] = torch.abs(grad_2d.clone())
-                    else:
-                        self.dense_gradients[name] = torch.abs(module.weight.grad.clone())
+            # Normalize gradients
+            if len(self.cached_batches) > 1:
+                 for name in self.dense_gradients:
+                      self.dense_gradients[name].div_(len(self.cached_batches))
+
         except Exception as e:
             print(f"[ERROR] Dense gradient sampling failed: {e}")
         finally:
+            # Restore training mode
+            self.model.train(training_mode)
+
             # Restore masks AND re-apply them to weights immediately
             # Important: Ensure weights are sparse before next training step
             self.masks = saved_masks
@@ -529,7 +552,13 @@ class SRigLScheduler:
         
         # Force dense gradient sample if stale
         if (self.gradient_steps + 1) >= self.next_dense_sample:
+            # If accumulator is used, we might need to wait or force cache fill
+            # Simplified: just sample if not enough in cache (synchronous)
             print("Force sampling dense gradients before update...")
+            if len(self.cached_batches) == 0:
+                 print("[WARNING] No cached batches for dense sampling! Skipping update.")
+                 return
+            
             self._sample_dense_gradients()
             self.next_dense_sample = self.gradient_steps + self.delta_T
         
