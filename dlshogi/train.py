@@ -82,6 +82,7 @@ Optimizer Examples:
     parser.add_argument('--srigl_alpha_final', type=float, default=0.0, help='Final update rate for SRigL')
     parser.add_argument('--srigl_gamma_sal', type=float, default=0.3, help='Neuron ablation threshold')
     parser.add_argument('--srigl_delta_T', type=int, default=100, help='Dense gradient sampling interval')
+    parser.add_argument('--srigl_dense_grad_accum', type=int, default=1, help='Number of batches to accumulate for dense gradient sampling')
     parser.add_argument('--srigl_use_erk', action='store_true', help='Use ERK distribution for layer-wise sparsity')
     parser.add_argument('--srigl_min_fan_in', type=int, default=1, help='Minimum fan-in per neuron')
     parser.add_argument('--srigl_prune_1x1', action='store_true', help='Enable pruning for 1x1 convolutions')
@@ -211,6 +212,7 @@ Optimizer Examples:
             alpha_final=args.srigl_alpha_final,
             gamma_sal=args.srigl_gamma_sal,
             delta_T=args.srigl_delta_T,
+            dense_grad_accum=args.srigl_dense_grad_accum, # Pass accumulation setting
             use_erk_distribution=args.srigl_use_erk,
             min_fan_in=args.srigl_min_fan_in,
             prune_1x1=args.srigl_prune_1x1, # Pass 1x1 prune setting
