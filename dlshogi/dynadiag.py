@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from torch.nn.modules.utils import _pair
 
 class DiagonalParam(nn.Module):
     """
@@ -10,7 +11,8 @@ class DiagonalParam(nn.Module):
     
     NOTE: This implementation simulates DynaDiag using dense tensor operations.
     It reproduces the *learning dynamics* and *accuracy* of the method, but NOT the 
-    training speedup. Real speedup requires custom CUDA kernels for BCSR conversion.
+    training speedup. Real speedup requires custom CUDA kernels for BCSR conversion
+    and sparse backpropagation as described in the paper (up to 1.59x training speedup).
     """
     def __init__(self, out_features, in_features, sparsity=0.9, temperature=1.0):
         super().__init__()
@@ -30,13 +32,15 @@ class DiagonalParam(nn.Module):
         target_active = int(total_params * (1.0 - sparsity))
         self.K = max(1, int(target_active / min_dim))
         
+        # Safety clip: K cannot exceed number of available diagonals
+        self.K = min(self.K, self.num_candidates)
+        
         # Importance weights alpha (learnable) - one per diagonal candidate
         self.alpha = nn.Parameter(torch.zeros(self.num_candidates))
         nn.init.normal_(self.alpha, mean=0.0, std=0.01)
         
         # Values V (learnable). 
         # Stored as dense tensor for PyTorch simulation.
-        # Ideally, we only store active diagonals, but for simulation we mask a dense weight.
         self.values = nn.Parameter(torch.Tensor(out_features, in_features))
         nn.init.kaiming_uniform_(self.values, a=math.sqrt(5))
         
@@ -51,7 +55,6 @@ class DiagonalParam(nn.Module):
         Computes the binary mask using Differentiable TopK (Eq 5).
         """
         # Eq 5: alpha_tilde = min(k * exp(a/T) / sum(...), 1)
-        # We implement this soft selection.
         soft_scores = self.K * F.softmax(self.alpha / self.temperature, dim=0)
         soft_scores = torch.clamp(soft_scores, max=1.0)
         
@@ -63,19 +66,15 @@ class DiagonalParam(nn.Module):
             _, topk_indices = torch.topk(self.alpha, self.K)
             
             # Create boolean mask for active diagonals
-            # diag_indices shape: (out, in), values in [0, num_candidates-1]
-            # active_diagonals shape: (num_candidates,)
             active_diagonals = torch.zeros(self.num_candidates, device=self.alpha.device, dtype=torch.bool)
             active_diagonals[topk_indices] = True
             
             hard_mask = active_diagonals[self.diag_indices].float()
             
             # 2. Soft Mask (Dense, for gradient approximation)
-            # Expand soft_scores to (out, in)
             soft_mask = soft_scores[self.diag_indices]
             
             # 3. Straight-Through Estimator
-            # y = hard + (soft - soft.detach())
             mask = hard_mask + (soft_mask - soft_mask.detach())
         else:
             # Inference: Strict Hard TopK
@@ -86,27 +85,18 @@ class DiagonalParam(nn.Module):
             
         return mask
 
-    def forward(self, x):
-        pass
-
 class DynaDiagLinear(nn.Linear):
     def __init__(self, in_features, out_features, bias=True, sparsity=0.9, temperature=1.0):
         super().__init__(in_features, out_features, bias)
         self.param_diag = DiagonalParam(out_features, in_features, sparsity, temperature)
-        
-        # Initialize values from original weights (if converting) or standard init
-        # Note: We keep self.weight as a dummy or delete it. 
-        # Safest is to delete it to ensure we don't accidentally use it.
         del self.weight
         
     def forward(self, input):
         mask = self.param_diag.get_mask()
-        # Apply mask to the dense values
         masked_weight = self.param_diag.values * mask
         return F.linear(input, masked_weight, self.bias)
         
     def get_l1_reg(self):
-        # L1 regularization on alpha (importance weights)
         return torch.sum(torch.abs(self.param_diag.alpha))
 
 class DynaDiagConv2d(nn.Conv2d):
@@ -116,9 +106,7 @@ class DynaDiagConv2d(nn.Conv2d):
         super().__init__(in_channels, out_channels, kernel_size, stride, padding, 
                          dilation, groups, bias, padding_mode)
         
-        # Flatten kernel for diagonal application
-        # Paper Appendix F.1 (CNNs): treats Conv weights as matrix
-        # Usually (Out, In * Kh * Kw)
+        # Flatten kernel for diagonal application (Out, In * Kh * Kw)
         self.flatten_in = in_channels * self.kernel_size[0] * self.kernel_size[1]
         self.param_diag = DiagonalParam(out_channels, self.flatten_in, sparsity, temperature)
         del self.weight
