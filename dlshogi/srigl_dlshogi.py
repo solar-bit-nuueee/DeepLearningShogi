@@ -483,39 +483,41 @@ class SRigLScheduler:
         return alpha
     
     def _reset_optimizer_state(self, optimizer, old_mask, new_mask, param):
-        """Reset optimizer state (momentum, etc) for regrown weights."""
-        if optimizer is None: return
-        
-        # grew: 0 -> 1, pruned: 1 -> 0
+        """Reset optimizer state (momentum, exp_avg, etc) for regrown weights."""
+        if optimizer is None:
+            return
+
         grew = (old_mask == 0) & (new_mask == 1)
         pruned = (old_mask == 1) & (new_mask == 0)
-        
+
         state = optimizer.state.get(param)
-        if state is None: return
-        
-        # Support for SGD, AdamW, Muon
-        # keys to reset: 'momentum_buffer' (SGD), 'exp_avg', 'exp_avg_sq' (Adam*)
+        if state is None:
+            return
+
         keys_to_reset = ['momentum_buffer', 'exp_avg', 'exp_avg_sq']
-        
-        # Muon specific state? Muon usually just has momentum_buffer
-        
         for key in keys_to_reset:
-            if key in state:
-                buf = state[key]
-                # Ensure buffer shape matches param (especially for Conv2d 4D vs 2D mask)
-                if buf.shape != grew.shape:
-                    if len(buf.shape) == 4 and len(grew.shape) == 2:
-                         # Reshape mask to 4D for element-wise op
-                        n_out, n_in = grew.shape
-                        kh, kw = param.shape[2], param.shape[3]
-                        grew_View = grew.view(n_out, n_in // (kh*kw), kh, kw)
-                        pruned_View = pruned.view(n_out, n_in // (kh*kw), kh, kw)
-                        
-                        buf.mul_((~pruned_View).to(buf.dtype))
-                        buf[grew_View.bool()] = 0.0
-                else:
-                    buf.mul_((~pruned).to(buf.dtype))
-                    buf[grew.bool()] = 0.0
+            if key not in state:
+                continue
+            buf = state[key]
+
+            # param is either 2D (Linear) or 4D (Conv2d: [O, I, KH, KW])
+            if buf.shape == param.data.shape:
+                if param.dim() == 4 and grew.dim() == 2:
+                    O, I, KH, KW = param.shape
+                    # grew/pruned: [O, I*KH*KW] -> [O, I, KH, KW]
+                    grew_4d = grew.view(O, I, KH, KW)
+                    pruned_4d = pruned.view(O, I, KH, KW)
+                    with torch.no_grad():
+                        buf.mul_((~pruned_4d).to(buf.dtype))
+                        buf[grew_4d.bool()] = 0.0
+                elif param.dim() == 2 and grew.shape == buf.shape:
+                    with torch.no_grad():
+                        buf.mul_((~pruned).to(buf.dtype))
+                        buf[grew.bool()] = 0.0
+            else:
+                # Shape mismatch: conservative safety fallback
+                with torch.no_grad():
+                    buf.zero_()
     
     def _srigl_update(self, global_step, optimizer=None):
         """
@@ -527,9 +529,9 @@ class SRigLScheduler:
         
         # Force dense gradient sample if stale
         if (self.gradient_steps + 1) >= self.next_dense_sample:
-             print("Force sampling dense gradients before update...")
-             self._sample_dense_gradients()
-             self.next_dense_sample = self.gradient_steps + self.delta_T
+            print("Force sampling dense gradients before update...")
+            self._sample_dense_gradients()
+            self.next_dense_sample = self.gradient_steps + self.delta_T
         
         alpha = self._compute_alpha(global_step)
         print(f"Update rate α(t): {alpha:.4f}\n")
@@ -586,9 +588,6 @@ class SRigLScheduler:
             
             # Consistency checks
             nz = int(final_mask.sum().item())
-            # For strict ERK compliance, total active params should match target (within rounding/ablation limits)
-            # Note: Ablation + constant fan-in might drift slightly from original target if not perfectly divisible, 
-            # but usually it's close. We'll log it.
             target_nz = self.layer_targets[name]
             
             # Check constant fan-in for active neurons
@@ -597,8 +596,9 @@ class SRigLScheduler:
             if len(active_fanins) > 0:
                 min_f = active_fanins.min().item()
                 max_f = active_fanins.max().item()
-                assert min_f == max_f == fan_in, \
+                assert min_f == max_f == fan_in, (
                     f"Fan-in consistency failed! Target: {fan_in}, Min: {min_f}, Max: {max_f}"
+                )
             
             n_active_neurons = (final_mask.sum(dim=1) > 0).sum().item()
             actual_sparsity = 1.0 - (nz / final_mask.numel())
@@ -610,6 +610,8 @@ class SRigLScheduler:
             print("")
         
         self.total_updates += 1
+        # Synchronize weights with final masks so next step always sees consistent sparse weights
+        self._apply_masks_to_weights()
         print(f"{'='*70}\n")
     
     def _compute_salient_weights(self, mask, weight, gradient, K):
@@ -660,7 +662,8 @@ class SRigLScheduler:
     def _ablate_neurons(self, mask, salient_mask, fan_in, gamma_sal):
         """Neuron ablation (paper Step 4)."""
         salient_per_neuron = salient_mask.sum(dim=1)
-        threshold = gamma_sal * fan_in
+        # Threshold should be an integer and at least 1 for stability (esp. CNN)
+        threshold = max(1, int(math.ceil(gamma_sal * fan_in)))
         active_neurons = salient_per_neuron >= threshold
         
         new_mask = mask.clone()
@@ -676,9 +679,9 @@ class SRigLScheduler:
         # Retrieve target non-zero count for this layer (preserved from init)
         target_active = self.layer_targets.get(name)
         if target_active is None:
-             # Fallback if somehow missing (shouldn't happen)
-             n_out, n_in = mask.shape
-             target_active = int(n_out * n_in * (1 - self.sparsity))
+            # Fallback if somehow missing (shouldn't happen)
+            n_out, n_in = mask.shape
+            target_active = int(n_out * n_in * (1 - self.sparsity))
         
         n_active_neurons = (mask.sum(dim=1) > 0).sum().item()
         
