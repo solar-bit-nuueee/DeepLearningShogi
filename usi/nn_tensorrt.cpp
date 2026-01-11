@@ -1,4 +1,4 @@
-﻿#include "nn_tensorrt.h"
+#include "nn_tensorrt.h"
 
 #include "cppshogi.h"
 #include "unpack.h"
@@ -90,6 +90,12 @@ void NNTensorRT::build(const std::string& onnx_filename)
 
 	builder->setMaxBatchSize(max_batch_size);
 	config->setMaxWorkspaceSize(64_MiB);
+
+	// Enable Sparse Weights for 2:4 structured sparsity optimization
+	// This requires NVIDIA Ampere GPU or newer
+#if NV_TENSORRT_MAJOR >= 8
+	config->setFlag(nvinfer1::BuilderFlag::kSPARSE_WEIGHTS);
+#endif
 
 	std::unique_ptr<nvinfer1::IInt8Calibrator> calibrator;
 	if (builder->platformHasFastInt8())
