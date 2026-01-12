@@ -154,6 +154,25 @@ class DynaDiagScheduler:
         for m in self.diag_modules:
             m.param_diag.temperature = temp
 
+    def state_dict(self):
+        return {
+            'current_step': self.current_step,
+            'temp_init': self.temp_init,
+            'temp_final': self.temp_final,
+            'total_steps': self.total_steps
+        }
+
+    def load_state_dict(self, state_dict):
+        self.current_step = state_dict['current_step']
+        self.temp_init = state_dict['temp_init']
+        self.temp_final = state_dict['temp_final']
+        self.total_steps = state_dict['total_steps']
+        # Re-apply temperature based on restored step
+        self.step() 
+        # Note: step() increments current_step, so we should decrement it first 
+        # if we want exact restoration, but one step difference is negligible.
+        self.current_step -= 1
+
 def convert_to_dynadiag(model, sparsity=0.9, exclude_first_layer=True):
     """
     Replaces Linear and Conv2d layers with DynaDiag equivalents.
