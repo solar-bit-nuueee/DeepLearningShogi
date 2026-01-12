@@ -134,8 +134,14 @@ Optimizer Examples:
         model = convert_to_dynadiag(model, sparsity=args.dynadiag_sparsity)
         model.to(device)
         logging.info('Model conversion complete.')
+        
+        # DynaDiag Safety Check: Disable SWA
+        if args.use_swa:
+            logging.warning("WARNING: SWA (Stochastic Weight Averaging) is NOT recommended with DynaDiag training "
+                            "due to potential instability with dynamic sparse topologies. Disabling SWA.")
+            args.use_swa = False
 
-    def create_optimizer(optimizer_str, model_params, lr, weight_decay):
+    def create_optimizer(optimizer_str, model, lr, weight_decay, use_dynadiag):
         """Create optimizer from string specification."""
         optimizer_name, optimizer_args = optimizer_str.split('(', 1)
         optimizer_args = eval(f'dict({optimizer_args.rstrip(")")})')
@@ -154,17 +160,41 @@ Optimizer Examples:
         else:
             optimizer_class = getattr(optim, optimizer_name)
 
-        if weight_decay >= 0:
-            optimizer_args["weight_decay"] = weight_decay
-
-        optimizer = optimizer_class(model_params, lr=lr, **optimizer_args)
+        # Prepare parameter groups
+        # If using DynaDiag, exclude 'alpha' parameters from L2 weight decay
+        # because we apply explicit L1 regularization to them.
+        if use_dynadiag:
+            dynadiag_params = []
+            other_params = []
+            for name, param in model.named_parameters():
+                if 'param_diag.alpha' in name:
+                    dynadiag_params.append(param)
+                else:
+                    other_params.append(param)
+            
+            param_groups = [
+                {'params': other_params}, # weight_decay from kwargs will apply here
+                {'params': dynadiag_params, 'weight_decay': 0.0} # No L2 for alpha
+            ]
+            
+            if weight_decay >= 0:
+                optimizer_args["weight_decay"] = weight_decay
+            
+            # Pass param_groups instead of model.parameters()
+            optimizer = optimizer_class(param_groups, lr=lr, **optimizer_args)
+        else:
+            # Standard path
+            if weight_decay >= 0:
+                optimizer_args["weight_decay"] = weight_decay
+            optimizer = optimizer_class(model.parameters(), lr=lr, **optimizer_args)
+            
         if not isinstance(optimizer, torch.optim.Optimizer):
             raise TypeError(f"Invalid optimizer type: {type(optimizer)}. Must be a subclass of torch.optim.Optimizer")
         return optimizer
 
     if args.optimizer[-1] != ')':
         args.optimizer += '()'
-    optimizer = create_optimizer(args.optimizer, model.parameters(), args.lr, args.weight_decay)
+    optimizer = create_optimizer(args.optimizer, model, args.lr, args.weight_decay, args.use_dynadiag)
 
     def create_scheduler(scheduler_str, optimizer):
         scheduler_name, scheduler_args = scheduler_str.split('(', 1)
@@ -287,7 +317,9 @@ Optimizer Examples:
                     for param_group in optimizer.param_groups:
                         param_group['lr'] = args.lr
                         if args.weight_decay >= 0:
-                            param_group['weight_decay'] = args.weight_decay
+                            # Apply decay only if param group allows it (i.e. not alpha group)
+                            if param_group.get('weight_decay', 1.0) > 0:
+                                param_group['weight_decay'] = args.weight_decay
             if args.use_amp and 'scaler' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler'])
             if args.lr_scheduler and not args.reset_scheduler and 'scheduler' in checkpoint:
@@ -303,6 +335,10 @@ Optimizer Examples:
                 srigl.total_updates = srigl_state['total_updates']
                 srigl.next_dense_sample = srigl_state['next_dense_sample']
                 logging.info('Restored SRigL state')
+            if args.use_dynadiag and 'dynadiag_scheduler' in checkpoint and dynadiag_scheduler is not None:
+                dynadiag_scheduler.load_state_dict(checkpoint['dynadiag_scheduler'])
+                logging.info('Restored DynaDiag scheduler state')
+
         else:
             # for compatibility
             logging.info('Loading the optimizer state from {}'.format(args.resume))
@@ -396,6 +432,8 @@ Optimizer Examples:
                 'total_updates': srigl.total_updates,
                 'next_dense_sample': srigl.next_dense_sample
             }
+        if args.use_dynadiag and dynadiag_scheduler is not None:
+            checkpoint['dynadiag_scheduler'] = dynadiag_scheduler.state_dict()
 
         torch.save(checkpoint, path)
 
