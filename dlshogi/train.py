@@ -11,6 +11,9 @@ from dlshogi.data_loader import Hcpe3DataLoader
 from dlshogi.data_loader import DataLoader
 from dlshogi.srigl_dlshogi import SRigLScheduler
 
+# Import DynaDiag components
+from dlshogi.dynadiag import convert_to_dynadiag, DynaDiagScheduler, get_dynadiag_l1_reg
+
 import argparse
 import random
 import sys
@@ -82,9 +85,18 @@ Optimizer Examples:
     parser.add_argument('--srigl_alpha_final', type=float, default=0.0, help='Final update rate for SRigL')
     parser.add_argument('--srigl_gamma_sal', type=float, default=0.3, help='Neuron ablation threshold')
     parser.add_argument('--srigl_delta_T', type=int, default=100, help='Dense gradient sampling interval')
+    parser.add_argument('--srigl_dense_grad_accum', type=int, default=1, help='Number of batches to accumulate for dense gradient sampling')
     parser.add_argument('--srigl_use_erk', action='store_true', help='Use ERK distribution for layer-wise sparsity')
     parser.add_argument('--srigl_min_fan_in', type=int, default=1, help='Minimum fan-in per neuron')
+    parser.add_argument('--srigl_prune_1x1', action='store_true', help='Enable pruning for 1x1 convolutions')
     
+    # DynaDiag arguments
+    parser.add_argument('--use_dynadiag', action='store_true', help='Use DynaDiag structured sparse training')
+    parser.add_argument('--dynadiag_sparsity', type=float, default=0.9, help='Target sparsity for DynaDiag')
+    parser.add_argument('--dynadiag_temp_init', type=float, default=10.0, help='Initial temperature for DynaDiag TopK')
+    parser.add_argument('--dynadiag_temp_final', type=float, default=0.1, help='Final temperature for DynaDiag TopK')
+    parser.add_argument('--dynadiag_l1_lambda', type=float, default=1e-5, help='L1 regularization coefficient for DynaDiag alpha')
+
     args = parser.parse_args(argv)
 
     if args.log:
@@ -112,19 +124,28 @@ Optimizer Examples:
     model = policy_value_network(args.network)
     model.to(device)
 
-    def create_optimizer(optimizer_str, model_params, lr, weight_decay):
-        """Create optimizer from string specification.
+    # Initialize DynaDiag Model (must be done BEFORE optimizer creation)
+    dynadiag_scheduler = None
+    if args.use_dynadiag:
+        if args.use_srigl:
+            raise ValueError("Cannot use both --use_srigl and --use_dynadiag. Please choose one.")
         
-        Supports both built-in PyTorch optimizers and external packages.
-        Examples:
-            'SGD(momentum=0.9)' -> torch.optim.SGD
-            'Adam()' -> torch.optim.Adam
-            'muon.Muon(momentum=0.95)' -> muon.Muon (requires: pip install muon-optimizer)
-        """
+        logging.info(f'Converting model to DynaDiag (sparsity={args.dynadiag_sparsity})...')
+        model = convert_to_dynadiag(model, sparsity=args.dynadiag_sparsity)
+        model.to(device)
+        logging.info('Model conversion complete.')
+        
+        # DynaDiag Safety Check: Disable SWA
+        if args.use_swa:
+            logging.warning("WARNING: SWA (Stochastic Weight Averaging) is NOT recommended with DynaDiag training "
+                            "due to potential instability with dynamic sparse topologies. Disabling SWA.")
+            args.use_swa = False
+
+    def create_optimizer(optimizer_str, model, lr, weight_decay, use_dynadiag):
+        """Create optimizer from string specification."""
         optimizer_name, optimizer_args = optimizer_str.split('(', 1)
         optimizer_args = eval(f'dict({optimizer_args.rstrip(")")})')
         
-        # Handle module.class notation (e.g., muon.Muon)
         if '.' in optimizer_name:
             module_name, class_name = optimizer_name.rsplit('.', 1)
             try:
@@ -137,21 +158,43 @@ Optimizer Examples:
                     f"Original error: {e}"
                 )
         else:
-            # Built-in PyTorch optimizer
             optimizer_class = getattr(optim, optimizer_name)
 
-        # Add weight_decay if specified
-        if weight_decay >= 0:
-            optimizer_args["weight_decay"] = weight_decay
-
-        optimizer = optimizer_class(model_params, lr=lr, **optimizer_args)
+        # Prepare parameter groups
+        # If using DynaDiag, exclude 'alpha' parameters from L2 weight decay
+        # because we apply explicit L1 regularization to them.
+        if use_dynadiag:
+            dynadiag_params = []
+            other_params = []
+            for name, param in model.named_parameters():
+                if 'param_diag.alpha' in name:
+                    dynadiag_params.append(param)
+                else:
+                    other_params.append(param)
+            
+            param_groups = [
+                {'params': other_params}, # weight_decay from kwargs will apply here
+                {'params': dynadiag_params, 'weight_decay': 0.0} # No L2 for alpha
+            ]
+            
+            if weight_decay >= 0:
+                optimizer_args["weight_decay"] = weight_decay
+            
+            # Pass param_groups instead of model.parameters()
+            optimizer = optimizer_class(param_groups, lr=lr, **optimizer_args)
+        else:
+            # Standard path
+            if weight_decay >= 0:
+                optimizer_args["weight_decay"] = weight_decay
+            optimizer = optimizer_class(model.parameters(), lr=lr, **optimizer_args)
+            
         if not isinstance(optimizer, torch.optim.Optimizer):
             raise TypeError(f"Invalid optimizer type: {type(optimizer)}. Must be a subclass of torch.optim.Optimizer")
         return optimizer
 
     if args.optimizer[-1] != ')':
         args.optimizer += '()'
-    optimizer = create_optimizer(args.optimizer, model.parameters(), args.lr, args.weight_decay)
+    optimizer = create_optimizer(args.optimizer, model, args.lr, args.weight_decay, args.use_dynadiag)
 
     def create_scheduler(scheduler_str, optimizer):
         scheduler_name, scheduler_args = scheduler_str.split('(', 1)
@@ -177,6 +220,25 @@ Optimizer Examples:
         ema_avg = lambda averaged_model_parameter, model_parameter, num_averaged : ema_a * averaged_model_parameter + ema_b * model_parameter
         swa_model = AveragedModel(model, avg_fn=ema_avg)
     
+    logging.info('Reading training data')
+    train_len, actual_len = Hcpe3DataLoader.load_files(args.train_data, args.use_average, args.use_evalfix, args.temperature, args.patch, args.cache)
+    train_data = np.arange(train_len, dtype=np.uint64)
+    logging.info('Reading test data')
+    test_data = np.fromfile(args.test_data, dtype=HuffmanCodedPosAndEval)
+
+    if args.use_average:
+        logging.info('train position num before preprocessing = {}'.format(actual_len))
+    logging.info('train position num = {}'.format(len(train_data)))
+    logging.info('test position num = {}'.format(len(test_data)))
+
+    train_dataloader = Hcpe3DataLoader(train_data, args.batchsize, device, shuffle=True)
+    test_dataloader = DataLoader(test_data, args.testbatchsize, device)
+    
+    # Calculate estimated total steps for SRigL/DynaDiag schedule
+    steps_per_epoch = len(train_dataloader)
+    total_steps = steps_per_epoch * args.epoch
+    logging.info(f'Total training steps: {total_steps}')
+
     # Initialize SRigL if enabled
     srigl = None
     if args.use_srigl:
@@ -186,16 +248,18 @@ Optimizer Examples:
             sparsity=args.srigl_sparsity,
             update_freq=args.srigl_update_freq,
             warmup_steps=args.srigl_warmup_steps,
+            total_steps=total_steps, # Pass total steps for alpha schedule
             alpha_init=args.srigl_alpha_init,
             alpha_final=args.srigl_alpha_final,
             gamma_sal=args.srigl_gamma_sal,
             delta_T=args.srigl_delta_T,
+            dense_grad_accum=args.srigl_dense_grad_accum,
             use_erk_distribution=args.srigl_use_erk,
             min_fan_in=args.srigl_min_fan_in,
+            prune_1x1=args.srigl_prune_1x1,
             device=device
         )
         
-        # Set forward and loss functions for dense gradient sampling
         def forward_fn(batch):
             x1, x2, t1, t2, value = batch
             return model(x1, x2)
@@ -210,6 +274,16 @@ Optimizer Examples:
         
         srigl.set_forward_loss_fn(forward_fn, loss_fn)
     
+    # Initialize DynaDiag Scheduler
+    if args.use_dynadiag:
+        logging.info(f'use dynadiag(sparsity={args.dynadiag_sparsity}, temp_init={args.dynadiag_temp_init}, l1_lambda={args.dynadiag_l1_lambda})')
+        dynadiag_scheduler = DynaDiagScheduler(
+            model=model,
+            temperature_init=args.dynadiag_temp_init,
+            temperature_final=args.dynadiag_temp_final,
+            total_steps=total_steps
+        )
+
     def cross_entropy_loss_with_soft_target(pred, soft_targets):
         return torch.sum(-soft_targets * F.log_softmax(pred, dim=1), 1)
     cross_entropy_loss = torch.nn.CrossEntropyLoss(reduction='none')
@@ -243,7 +317,9 @@ Optimizer Examples:
                     for param_group in optimizer.param_groups:
                         param_group['lr'] = args.lr
                         if args.weight_decay >= 0:
-                            param_group['weight_decay'] = args.weight_decay
+                            # Apply decay only if param group allows it (i.e. not alpha group)
+                            if param_group.get('weight_decay', 1.0) > 0:
+                                param_group['weight_decay'] = args.weight_decay
             if args.use_amp and 'scaler' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler'])
             if args.lr_scheduler and not args.reset_scheduler and 'scheduler' in checkpoint:
@@ -253,11 +329,16 @@ Optimizer Examples:
                 srigl_state = checkpoint['srigl']
                 srigl.masks = srigl_state['masks']
                 srigl.fan_in = srigl_state['fan_in']
+                srigl.layer_targets = srigl_state.get('layer_targets', {})
                 srigl.dense_gradients = srigl_state['dense_gradients']
                 srigl.gradient_steps = srigl_state['gradient_steps']
                 srigl.total_updates = srigl_state['total_updates']
                 srigl.next_dense_sample = srigl_state['next_dense_sample']
                 logging.info('Restored SRigL state')
+            if args.use_dynadiag and 'dynadiag_scheduler' in checkpoint and dynadiag_scheduler is not None:
+                dynadiag_scheduler.load_state_dict(checkpoint['dynadiag_scheduler'])
+                logging.info('Restored DynaDiag scheduler state')
+
         else:
             # for compatibility
             logging.info('Loading the optimizer state from {}'.format(args.resume))
@@ -269,20 +350,6 @@ Optimizer Examples:
         t = 0
 
     logging.info('optimizer {}'.format(re.sub(' +', ' ', str(optimizer).replace('\n', ''))))
-
-    logging.info('Reading training data')
-    train_len, actual_len = Hcpe3DataLoader.load_files(args.train_data, args.use_average, args.use_evalfix, args.temperature, args.patch, args.cache)
-    train_data = np.arange(train_len, dtype=np.uint64)
-    logging.info('Reading test data')
-    test_data = np.fromfile(args.test_data, dtype=HuffmanCodedPosAndEval)
-
-    if args.use_average:
-        logging.info('train position num before preprocessing = {}'.format(actual_len))
-    logging.info('train position num = {}'.format(len(train_data)))
-    logging.info('test position num = {}'.format(len(test_data)))
-
-    train_dataloader = Hcpe3DataLoader(train_data, args.batchsize, device, shuffle=True)
-    test_dataloader = DataLoader(test_data, args.testbatchsize, device)
 
     # for SWA update_bn
     def hcpe_loader(data, batchsize):
@@ -356,15 +423,17 @@ Optimizer Examples:
         if args.lr_scheduler:
             checkpoint['scheduler'] = scheduler.state_dict()
         if args.use_srigl and srigl is not None:
-            # Save SRigL state
             checkpoint['srigl'] = {
                 'masks': srigl.masks,
                 'fan_in': srigl.fan_in,
+                'layer_targets': srigl.layer_targets,
                 'dense_gradients': srigl.dense_gradients,
                 'gradient_steps': srigl.gradient_steps,
                 'total_updates': srigl.total_updates,
                 'next_dense_sample': srigl.next_dense_sample
             }
+        if args.use_dynadiag and dynadiag_scheduler is not None:
+            checkpoint['dynadiag_scheduler'] = dynadiag_scheduler.state_dict()
 
         torch.save(checkpoint, path)
 
@@ -392,7 +461,7 @@ Optimizer Examples:
         sum_loss3_epoch = 0
         sum_loss_epoch = 0
         for x1, x2, t1, t2, value in train_dataloader:
-            # SRigL: before step (dense gradient sampling)
+            # SRigL: before step
             if args.use_srigl and srigl is not None:
                 srigl.before_step((x1, x2, t1, t2, value))
             
@@ -415,10 +484,15 @@ Optimizer Examples:
                 loss2 = bce_with_logits_loss(y2, t2)
                 loss3 = bce_with_logits_loss(y2, value)
                 loss = loss1 + (1 - val_lambda) * loss2 + val_lambda * loss3
+                
+                # DynaDiag L1 Regularization
+                if args.use_dynadiag:
+                    l1_reg = get_dynadiag_l1_reg(model)
+                    loss += args.dynadiag_l1_lambda * l1_reg
 
             scaler.scale(loss).backward()
             
-            # SRigL: after backward (mask gradients)
+            # SRigL: after backward
             if args.use_srigl and srigl is not None:
                 srigl.after_backward()
             
@@ -428,9 +502,13 @@ Optimizer Examples:
             scaler.step(optimizer)
             scaler.update()
             
-            # SRigL: after step (mask weights and update topology)
+            # SRigL: after step
             if args.use_srigl and srigl is not None:
-                srigl.after_step(t)
+                srigl.after_step(t, optimizer)
+            
+            # DynaDiag: step scheduler
+            if args.use_dynadiag and dynadiag_scheduler is not None:
+                dynadiag_scheduler.step()
 
             if args.use_swa and epoch >= args.swa_start_epoch and t % args.swa_freq == 0:
                 swa_model.update_parameters(model)
